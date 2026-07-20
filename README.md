@@ -1,6 +1,8 @@
 # Nanopaint
 
-Very small ASCII paint
+Very small ASCII paint.
+
+Inspired by [antirez/kilo](https://github.com/antirez/kilo/)
 
 ![Logo image](screenshot.png)
 
