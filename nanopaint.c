@@ -84,16 +84,6 @@ static int utf8_len(unsigned char c) {
     return 1;                   /* 1-byte ASCII */
 }
 
-// Return the number of UTF-8 characters in a null-terminated string.
-static int utf8_strlen(const char *s) {
-    int n = 0;
-    while (*s) {
-        s += utf8_len((unsigned char)*s);
-        n++;
-    }
-    return n;
-}
-
 // Copy a UTF-8 character from src to dst (up to 4 bytes + null).
 static void utf8_cpy(char *dst, const char *src) {
     int len = utf8_len((unsigned char)*src);
@@ -230,7 +220,60 @@ static void initBlankCanvas(void) {
 }
 
 /* ----------------------------------------------------------------- */
-/*  Load a text file into the canvas                                  */
+/*  Count visible UTF-8 characters in a line, skipping ANSI codes.    */
+/* ----------------------------------------------------------------- */
+
+// Count the visible UTF-8 characters in a line, skipping any ANSI
+// escape sequences that might be embedded (e.g. colour codes from
+// a previous save). Plain text with no ANSI codes works too.
+static int count_visible_chars(const char *s) {
+    int n = 0;
+    while (*s) {
+        if ((unsigned char)*s == '\x1b' && *(s + 1) == '[') {
+            s += 2;
+            while (*s && *s != 'm') s++;
+            if (*s == 'm') s++;
+            continue;
+        }
+        s = utf8_next(s);
+        n++;
+    }
+    return n;
+}
+
+// Fill one canvas row by parsing a line that may contain ANSI colour
+// codes.  Each ESC[<N>m sequence sets the colour index for all
+// following characters until the next code (or end of line).  Plain
+// text with no ANSI codes gets colour 7 (white).
+static void fill_row(const char *line, int row) {
+    int c = 0, color = 7;
+    while (*line && c < canvas_cols) {
+        if ((unsigned char)*line == '\x1b' && *(line + 1) == '[') {
+            line += 2;
+            int val = 0;
+            while (*line && *line != 'm') {
+                if (*line >= '0' && *line <= '9') val = val * 10 + (*line - '0');
+                line++;
+            }
+            if (*line == 'm') line++;
+            if (val == 0 || val == 39) { color = 7; }
+            else {
+                for (int i = 0; i < 10; i++) {
+                    if (ansi_colors[i] == val) { color = i; break; }
+                }
+            }
+            continue;
+        }
+        int idx = row * canvas_cols + c;
+        utf8_cpy(canvas[idx], line);
+        cell_colors[idx] = color;
+        line = utf8_next(line);
+        c++;
+    }
+}
+
+/* ----------------------------------------------------------------- */
+/*  Load a text file into the canvas (supports ANSI colour codes).    */
 /* ----------------------------------------------------------------- */
 
 static void loadFile(const char *path) {
@@ -242,7 +285,7 @@ static void loadFile(const char *path) {
     char **tmp = NULL;       // temporary array of raw lines
     int tmpnum = 0;          // number of lines
     int tmpcap = 0;          // capacity of tmp array
-    int max_line_chars = 0;  // max UTF-8 characters in any line
+    int max_line_chars = 0;  // max visible chars in any line
     char line[4096];
 
     while (fgets(line, sizeof(line), fp)) {
@@ -258,8 +301,8 @@ static void loadFile(const char *path) {
 
         tmp[tmpnum] = strdup(line);
 
-        // Update the maximum character width for this line
-        int chars = utf8_strlen(line);
+        // Update the maximum character width (skipping ANSI codes)
+        int chars = count_visible_chars(line);
         if (chars > max_line_chars) max_line_chars = chars;
 
         tmpnum++;
@@ -281,14 +324,10 @@ static void loadFile(const char *path) {
     }
 
     // ---- Fill the canvas from the temporary lines. ------------------
+    //     Parses ANSI colour codes so a saved file re-opens with the
+    //     correct colours; plain text gets default colour 7.
     for (int r = 0; r < tmpnum; r++) {
-        const char *p = tmp[r];
-        int c = 0;
-        while (*p && c < canvas_cols) {
-            utf8_cpy(canvas[r * canvas_cols + c], p);
-            p = utf8_next(p);
-            c++;
-        }
+        fill_row(tmp[r], r);
         free(tmp[r]);
     }
     free(tmp);
@@ -458,6 +497,9 @@ static void handleKey(unsigned char c) {
 
 /* ----------------------------------------------------------------- */
 /*  Save the canvas back to the file it was loaded from               */
+/*  Writes ANSI colour codes inline, so the file is self-contained:   */
+/*  - cat <file> shows colours in any ANSI-capable terminal           */
+/*  - reopening in nanopaint restores both characters and colours     */
 /* ----------------------------------------------------------------- */
 
 static void saveFile(void) {
@@ -467,8 +509,15 @@ static void saveFile(void) {
     if (!fp) return;
 
     for (int r = 0; r < canvas_rows; r++) {
+        int last_color = -1;
         for (int c = 0; c < canvas_cols; c++) {
-            char *cell = canvas[r * canvas_cols + c];
+            int idx = r * canvas_cols + c;
+            int color = cell_colors ? cell_colors[idx] : 7;
+            if (color != last_color) {
+                fprintf(fp, "\x1b[%dm", ansi_colors[color]);
+                last_color = color;
+            }
+            char *cell = canvas[idx];
             fputs(cell, fp);
         }
         fputc('\n', fp);
