@@ -1,7 +1,7 @@
 /*
  * nanopaint
  *
- * In progress: Terminal paint application
+ * Terminal ASCII paint brush
  *
  * Build: clang -O3 -Wall -Wextra -o nanopaint nanopaint.c
  * Run:   ./nanopaint [filename]
