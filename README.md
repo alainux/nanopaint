@@ -17,6 +17,7 @@ clang -O3 -Wall -Wextra -o nanopaint nanopaint.c
 - 0-9 are colors (0=black 1=red 2=grn 3=yel 4=blu 5=mag 6=cyn 7=wht 8=brblk 9=brred)
 - Any character inserted (i.e. any keystroke) will set the active character.
 - click-drag and move the mouse to paint
+- CTRL+S to save
 
 **TODO**: 
 - [ ] Save to file even if it doesn't exist

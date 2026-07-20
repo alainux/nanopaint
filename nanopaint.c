@@ -402,6 +402,26 @@ static void handleMouseEvent(void) {
 /*  Handle a regular key press — set brush character or colour        */
 /* ----------------------------------------------------------------- */
 
+// Read exactly N bytes with blocking semantics. Temporarily sets VMIN=1
+// so we don't time out reading continuation bytes from the Character Viewer.
+static int readn(unsigned char *buf, int n) {
+    struct termios t;
+    tcgetattr(STDIN_FILENO, &t);
+    t.c_cc[VMIN] = n;
+    t.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+    int got = 0;
+    while (got < n) {
+        int r = read(STDIN_FILENO, buf + got, n - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    t.c_cc[VMIN] = 0;
+    t.c_cc[VTIME] = 1;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+    return got;
+}
+
 static void handleKey(unsigned char c) {
     // Digit keys 0-9 set the brush colour.
     if (c >= '0' && c <= '9') {
@@ -418,18 +438,20 @@ static void handleKey(unsigned char c) {
         brush[0] = c;
         brush[1] = '\0';
     } else if (len > 1) {
-        char tmp[5];
-        tmp[0] = c;
-        int ok = 1;
-        for (int i = 1; i < len; i++) {
-            unsigned char b;
-            if (read(STDIN_FILENO, &b, 1) != 1) { ok = 0; break; }
-            if ((b & 0xC0) != 0x80) { ok = 0; break; }
-            tmp[i] = b;
-        }
-        if (ok) {
-            tmp[len] = '\0';
-            strcpy(brush, tmp);
+        unsigned char tail[4];
+        int got = readn(tail, len - 1);
+        if (got == len - 1) {
+            int ok = 1;
+            for (int i = 0; i < len - 1; i++) {
+                if ((tail[i] & 0xC0) != 0x80) { ok = 0; break; }
+            }
+            if (ok) {
+                char tmp[5];
+                tmp[0] = c;
+                for (int i = 0; i < len - 1; i++) tmp[i + 1] = tail[i];
+                tmp[len] = '\0';
+                strcpy(brush, tmp);
+            }
         }
     }
 }
@@ -439,9 +461,9 @@ static void handleKey(unsigned char c) {
 /* ----------------------------------------------------------------- */
 
 static void saveFile(void) {
-    if (!filepath) return;
+    const char *path = filepath ? filepath : "untitled.txt";
 
-    FILE *fp = fopen(filepath, "w");
+    FILE *fp = fopen(path, "w");
     if (!fp) return;
 
     for (int r = 0; r < canvas_rows; r++) {
@@ -452,6 +474,8 @@ static void saveFile(void) {
         fputc('\n', fp);
     }
     fclose(fp);
+
+    filepath = path;
 }
 
 /* ----------------------------------------------------------------- */
