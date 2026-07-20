@@ -334,18 +334,10 @@ static void loadFile(const char *path) {
 }
 
 /* ----------------------------------------------------------------- */
-/*  Draw the entire screen from scratch                              */
+/*  Draw the entire screen — row by row to avoid flicker              */
 /* ----------------------------------------------------------------- */
 
 static void render(void) {
-    // Clear the entire screen before drawing. Every frame starts from
-    // a clean slate — old cursor blocks, stale content, anything left
-    // from a previous resize is all erased. Then we draw exactly what
-    // should be visible right now.
-    // ESC[2J  = erase entire display
-    // ESC[H   = move cursor home
-    write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
-
     // Query the current terminal size at draw time. This means we
     // automatically adapt to window resize on every frame.
     struct winsize ws;
@@ -355,7 +347,15 @@ static void render(void) {
 
     // Draw as many canvas rows as fit in the terminal window.
     int draw_rows = (canvas_rows < screen_rows) ? canvas_rows : screen_rows;
+
     for (int r = 0; r < draw_rows; r++) {
+        // Move cursor to start of row (1-based), clear to end of line,
+        // then draw the row content. This row-by-row clear+draw avoids
+        // the flicker of clearing the entire screen first.
+        // ESC[<row>;1H  = position cursor at row, column 1 (1-based)
+        // ESC[K         = clear from cursor to end of line
+        printf("\x1b[%d;1H\x1b[K", r + 1);
+
         // Build a line from the cells of this row; stop at screen_cols.
         // Each cell is a NUL-terminated UTF-8 string, so we just
         // concatenate them. Emit ANSI colour codes when the colour
@@ -380,8 +380,14 @@ static void render(void) {
         }
         linebuf[pos] = '\0';
 
-        // ESC[<row>;1H positions the cursor (1-based)
-        printf("\x1b[%d;1H%s\x1b[39m", r + 1, linebuf);
+        // Print the built line, then reset colour.
+        printf("%s\x1b[39m", linebuf);
+    }
+
+    // Clear any remaining rows below the canvas (in case canvas shrank
+    // or terminal grew). Clear row by row to avoid flicker.
+    for (int r = draw_rows; r < screen_rows; r++) {
+        printf("\x1b[%d;1H\x1b[K", r + 1);
     }
 
     // Draw the solid cursor square on top, in the current brush colour.
