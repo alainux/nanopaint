@@ -1,6 +1,6 @@
 # Nanopaint
 
-Very small ASCII paint made in pure C.
+Very small ASCII paint
 
 ![Logo image](screenshot.png)
 
