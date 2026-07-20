@@ -4,7 +4,7 @@ Very small ASCII paint that lets you paint characters with a brush on the screen
 
 Inspired by [antirez/kilo](https://github.com/antirez/kilo/)
 
-![Logo image](screenshot.png)
+![Logo image](screenshot2.png)
 
 **Build with**:
 
