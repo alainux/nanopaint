@@ -60,6 +60,15 @@ static int is_drawing = 0;
 static int last_paint_x = -1, last_paint_y = -1;
 
 /* ----------------------------------------------------------------- */
+/*  Text typing mode                                                  */
+/* ----------------------------------------------------------------- */
+
+static int typing_mode = 0;              /* 1 = typing active */
+static int typing_x = -1, typing_y = -1; /* cursor position, -1 = unset */
+static int typing_anchor_x = -1, typing_anchor_y = -1; /* where click landed */
+static int mouse_seen = 0;               /* set by handleMouseEvent on valid parse */
+
+/* ----------------------------------------------------------------- */
 /*  Cell colours — parallel array, one byte per cell, 0-9             */
 /* ----------------------------------------------------------------- */
 
@@ -72,6 +81,105 @@ static unsigned char *cell_colors = NULL;
 static const int ansi_colors[] = {
     30, 31, 32, 33, 34, 35, 36, 37, 90, 91
     // 0=black 1=red 2=grn 3=yel 4=blu 5=mag 6=cyn 7=wht 8=brblk 9=brred
+};
+
+static const char *color_names[] = {
+    "black", "red", "green", "yellow", "blue",
+    "magenta", "cyan", "white", "brblk", "brred"
+};
+
+/* ----------------------------------------------------------------- */
+/*  Undo / Redo                                                       */
+/* ----------------------------------------------------------------- */
+/*  Each stroke saves the canvas state so we can undo/redo.           */
+/*  MAX_UNDO limits memory; older states are dropped.                 */
+/* ----------------------------------------------------------------- */
+
+#define MAX_UNDO 100
+
+struct CanvasState {
+    char *canvas;
+    unsigned char *colors;
+    int rows;
+    int cols;
+};
+
+static struct CanvasState *undo_stack[MAX_UNDO];
+static int undo_count = 0;
+static struct CanvasState *redo_stack[MAX_UNDO];
+static int redo_count = 0;
+
+static struct CanvasState *save_state(void) {
+    struct CanvasState *s = malloc(sizeof(*s));
+    int n = canvas_rows * canvas_cols;
+    s->rows = canvas_rows;
+    s->cols = canvas_cols;
+    s->canvas = malloc(n * 5);
+    s->colors = malloc(n);
+    if (s->canvas) memcpy(s->canvas, canvas, n * 5);
+    if (s->colors) memcpy(s->colors, cell_colors, n);
+    return s;
+}
+
+static void restore_state(struct CanvasState *s) {
+    int n = canvas_rows * canvas_cols;
+    memcpy(canvas, s->canvas, n * 5);
+    memcpy(cell_colors, s->colors, n);
+}
+
+static void free_state(struct CanvasState *s) {
+    free(s->canvas);
+    free(s->colors);
+    free(s);
+}
+
+// Call BEFORE modifying the canvas.
+static void push_undo(void) {
+    if (undo_count >= MAX_UNDO) {
+        free_state(undo_stack[0]);
+        memmove(undo_stack, undo_stack + 1, (MAX_UNDO - 1) * sizeof(void *));
+        undo_count = MAX_UNDO - 1;
+    }
+    undo_stack[undo_count++] = save_state();
+    for (int i = 0; i < redo_count; i++) free_state(redo_stack[i]);
+    redo_count = 0;
+}
+
+static void undo(void) {
+    if (undo_count == 0) return;
+    struct CanvasState *s = undo_stack[--undo_count];
+    if (redo_count >= MAX_UNDO) {
+        free_state(redo_stack[0]);
+        memmove(redo_stack, redo_stack + 1, (MAX_UNDO - 1) * sizeof(void *));
+        redo_count = MAX_UNDO - 1;
+    }
+    redo_stack[redo_count++] = save_state();
+    restore_state(s);
+    free_state(s);
+}
+
+static void redo(void) {
+    if (redo_count == 0) return;
+    struct CanvasState *s = redo_stack[--redo_count];
+    if (undo_count >= MAX_UNDO) {
+        free_state(undo_stack[0]);
+        memmove(undo_stack, undo_stack + 1, (MAX_UNDO - 1) * sizeof(void *));
+        undo_count = MAX_UNDO - 1;
+    }
+    undo_stack[undo_count++] = save_state();
+    restore_state(s);
+    free_state(s);
+}
+
+/* ----------------------------------------------------------------- */
+/*  Command table                                                     */
+/* ----------------------------------------------------------------- */
+
+struct Command {
+    unsigned char key;
+    const char *label;    // Short label for toolbar
+    const char *desc;     // Description
+    void (*handler)(void);
 };
 
 /* ----------------------------------------------------------------- */
@@ -106,39 +214,9 @@ static void enableRawMode(void) {
     tcgetattr(STDIN_FILENO, &orig_tios);
     struct termios raw = orig_tios;
 
-    // c_lflag (local mode flags) — control how the terminal driver processes
-    // input before your program sees it:
-    // ECHO      Automatically print every character the user types.
-    //           Off = you control what's displayed.
-    // ICANON    Canonical (line-buffered) mode.
-    //           Off = each byte delivered immediately, no Enter needed.
-    // IEXTEN    Enables implementation-defined special characters
-    //           (like Ctrl+V for literal next on macOS/Linux).
-    //           Off = no special processing.
-    // ISIG      Enables signal-generating keys (Ctrl+C → SIGINT,
-    //           Ctrl+Z → SIGTSTP). Off = you handle those keys yourself.
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-
-    // c_iflag (input flags):
-    // BRKINT    Break condition sends SIGINT. Off = ignore.
-    // ICRNL     Translates CR (carriage return, \r) to NL (\n).
-    //           Off = we see the actual byte.
-    // INPCK     Enables parity checking. Off = ignore parity.
-    // ISTRIP    Strips the 8th bit off each byte.
-    //           Off = we get full 8-bit values (needed for UTF-8).
-    // IXON      Enables XON/XOFF flow control (Ctrl+S/Ctrl+Q).
-    //           Off = those keys pass through to our program.
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-
-    // c_oflag (output flags):
-    // OPOST     Enables output processing. Off = terminal won't translate
-    //           \n to \r\n or mangle our escape sequences.
     raw.c_oflag &= ~(OPOST);
-
-    // c_cc (control characters):
-    // VMIN = 0  Minimum bytes before read() returns.
-    //           0 = return immediately on timeout.
-    // VTIME = 1 Timeout in deciseconds (tenths of seconds). 1 = 100ms.
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 1;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
@@ -362,8 +440,9 @@ static void render(void) {
     int screen_rows = ws.ws_row;
     int screen_cols = ws.ws_col;
 
-    // Draw as many canvas rows as fit in the terminal window.
-    int draw_rows = (canvas_rows < screen_rows) ? canvas_rows : screen_rows;
+    // Reserve the last row for the toolbar.
+    int avail_rows = screen_rows - 1;
+    int draw_rows = (canvas_rows < avail_rows) ? canvas_rows : avail_rows;
 
     for (int r = 0; r < draw_rows; r++) {
         // Move cursor to start of row (1-based), clear to end of line,
@@ -401,16 +480,35 @@ static void render(void) {
         printf("%s\x1b[39m", linebuf);
     }
 
-    // Clear any remaining rows below the canvas (in case canvas shrank
-    // or terminal grew). Clear row by row to avoid flicker.
-    for (int r = draw_rows; r < screen_rows; r++) {
+    // Clear any remaining rows below the canvas (including toolbar row).
+    for (int r = draw_rows; r <= screen_rows; r++) {
         printf("\x1b[%d;1H\x1b[K", r + 1);
     }
 
+    // Draw the toolbar at the bottom of the terminal.
+    // ESC[7m/27m = reverse video on/off for a "status bar" look.
+    // ESC[<N>m / 39m = set / reset foreground colour.
+    int tool_row = screen_rows;
+    printf("\x1b[%d;1H\x1b[7m", tool_row);
+    if (typing_mode && typing_x >= 0) {
+        printf(" Type @ %d,%d \x1b[27m\x1b[39m  |  ^C:quit", typing_x, typing_y);
+    } else if (typing_mode) {
+        printf(" Type: click canvas \x1b[27m\x1b[39m  |  ^C:quit");
+    } else {
+        printf(" Brush: \x1b[%dm %s \x1b[27m\x1b[39m"
+               "  %s  |  0-9:color  ^S:save  ^Z:undo  ^Y:redo  ^T:type  ^C:quit",
+               ansi_colors[brush_color], brush, color_names[brush_color]);
+    }
+
     // Draw the solid cursor square on top, in the current brush colour.
-    // ESC[7m  = reverse video (space becomes a solid block)
-    // ESC[27m = reverse video off
-    if (mx >= 1 && my >= 1 && mx <= screen_cols && my <= screen_rows) {
+    // Only show in the canvas area (not in the toolbar row).
+    if (typing_mode && typing_x >= 0 && typing_y >= 0) {
+        int tx = typing_x + 1, ty = typing_y + 1;
+        if (tx <= screen_cols && ty < screen_rows) {
+            printf("\x1b[%d;%dH\x1b[%dm\x1b[7m \x1b[27m\x1b[39m",
+                   ty, tx, ansi_colors[brush_color]);
+        }
+    } else if (mx >= 1 && my >= 1 && mx <= screen_cols && my < screen_rows) {
         printf("\x1b[%d;%dH\x1b[%dm\x1b[7m \x1b[27m\x1b[39m",
                my, mx, ansi_colors[brush_color]);
     }
@@ -430,31 +528,51 @@ static void handleMouseEvent(void) {
     if (read(STDIN_FILENO, hdr + 1, 1) != 1) return;
     if (hdr[1] != '<') return;
 
-    // Read the "button;col;row" payload until the terminating M or m
+    // Read the "button;col;row" payload until the terminating M or m.
+    // Uppercase M = press/drag, lowercase m = release.
     char buf[64];
     int bl = 0;
+    int is_release = 0;
     while (bl < 63) {
         unsigned char ch;
         if (read(STDIN_FILENO, &ch, 1) != 1) return;
-        if (ch == 'M' || ch == 'm') break;
+        if (ch == 'M') break;
+        if (ch == 'm') { is_release = 1; break; }
         buf[bl++] = ch;
     }
     buf[bl] = 0;
 
+    if (is_release) {
+        mouse_seen = 1;
+        is_drawing = 0;
+        return;
+    }
+
     int button, x, y;
     if (sscanf(buf, "%d;%d;%d", &button, &x, &y) != 3) return;
 
-    // SGR coordinates are 1-based, same as our ANSI cursor positioning
+    mouse_seen = 1;
     mx = x; my = y;
-
     int cx = x - 1, cy = y - 1;
 
-    // button 0 = press, 32 = drag, 35 = release with motion, 'm' = release
+    // In typing mode, a click positions the cursor instead of painting.
+    if (typing_mode && button == 0
+        && cx >= 0 && cx < canvas_cols && cy >= 0 && cy < canvas_rows) {
+        push_undo();
+        typing_x = typing_anchor_x = cx;
+        typing_y = typing_anchor_y = cy;
+        return;
+    }
+
+    // button 0 = press, 32 = drag, 35 = release with motion
     if (button == 0) {
-        is_drawing = 1;
-        last_paint_x = cx;
-        last_paint_y = cy;
-        paint_cell(cx, cy);
+        if (cx >= 0 && cx < canvas_cols && cy >= 0 && cy < canvas_rows) {
+            push_undo();
+            is_drawing = 1;
+            last_paint_x = cx;
+            last_paint_y = cy;
+            paint_cell(cx, cy);
+        }
     } else if (button == 32) {
         if (is_drawing && (cx != last_paint_x || cy != last_paint_y)) {
             paint_line(last_paint_x, last_paint_y, cx, cy);
@@ -557,27 +675,121 @@ static void saveFile(void) {
 }
 
 /* ----------------------------------------------------------------- */
+/*  Command handlers                                                  */
+/* ----------------------------------------------------------------- */
+
+static void cmd_quit(void) { quit = 1; }
+static void cmd_save(void) { saveFile(); }
+static void cmd_type(void) { typing_mode = 1; typing_x = typing_y = -1; }
+
+// The command table: each entry maps a key byte to a named action.
+// To add a new command, add an entry here and define the handler above.
+static const struct Command commands[] = {
+    { 3,  "C",   "Quit",  cmd_quit },
+    { 19, "S",   "Save",  cmd_save },
+    { 26, "Z",   "Undo",  undo     },
+    { 25, "Y",   "Redo",  redo     },
+    { 20, "T",   "Type",  cmd_type },
+    { 0,  NULL,  NULL,  NULL       }
+};
+
+/* ----------------------------------------------------------------- */
+/*  Typing-mode key handler                                           */
+/* ----------------------------------------------------------------- */
+
+// Find the last non-space column on a given row (-1 if the row is blank).
+static int last_content_col(int row) {
+    for (int c = canvas_cols - 1; c >= 0; c--)
+        if (canvas[row * canvas_cols + c][0] != ' ') return c;
+    return -1;
+}
+
+static void handleTyping(unsigned char c) {
+    if (typing_x < 0 || typing_y < 0) return;
+
+    if (c == '\r' || c == '\n') {
+        typing_y++;
+        typing_x = typing_anchor_x;
+        if (typing_y >= canvas_rows) typing_y = canvas_rows - 1;
+    } else if (c == 127) {
+        if (typing_x > 0) {
+            typing_x--;
+        } else if (typing_y > 0) {
+            typing_y--;
+            int last = last_content_col(typing_y);
+            typing_x = (last >= 0) ? last : 0;
+        }
+        int idx = typing_y * canvas_cols + typing_x;
+        canvas[idx][0] = ' ';
+        canvas[idx][1] = '\0';
+        cell_colors[idx] = brush_color;
+    } else if (c >= 32 && c <= 126) {
+        if (typing_x < canvas_cols) {
+            int idx = typing_y * canvas_cols + typing_x;
+            canvas[idx][0] = c;
+            canvas[idx][1] = '\0';
+            cell_colors[idx] = brush_color;
+            typing_x++;
+        }
+    } else {
+        unsigned char uc = c;
+        int len = utf8_len(uc);
+        if (len > 1 && typing_x < canvas_cols) {
+            unsigned char tail[4];
+            int got = readn(tail, len - 1);
+            if (got == len - 1) {
+                int ok = 1;
+                for (int i = 0; i < len - 1; i++)
+                    if ((tail[i] & 0xC0) != 0x80) { ok = 0; break; }
+                if (ok) {
+                    int idx = typing_y * canvas_cols + typing_x;
+                    canvas[idx][0] = c;
+                    for (int i = 0; i < len - 1; i++) canvas[idx][i + 1] = tail[i];
+                    canvas[idx][len] = '\0';
+                    cell_colors[idx] = brush_color;
+                    typing_x++;
+                }
+            }
+        }
+    }
+}
+
+/* ----------------------------------------------------------------- */
 /*  Main loop — redraw continuously, handle input when it arrives    */
 /* ----------------------------------------------------------------- */
 
 static void mainLoop(void) {
     while (!quit) {
-        // Render every frame. This is the "video" approach:
-        //   - Terminal resize? It just works — we query the size each time.
-        //   - Cursor moved? The next frame draws it at the new position.
-        //   - No special-case logic for any of it.
         render();
 
-        // Wait for input. VMIN=0, VTIME=1 means read() returns after
-        // ~100ms if nothing is available — that's our "frame rate".
         unsigned char c;
         if (read(STDIN_FILENO, &c, 1) == 0) continue;
 
-        // Ctrl+C to quit
-        if (c == 3) break;
+        // In typing mode, keyboard input draws onto the canvas.
+        // ESC exits typing mode; a standalone ESC is detected when
+        // handleMouseEvent returns without seeing a valid SGR report.
+        if (typing_mode) {
+            if (c == '\x1b') {
+                mouse_seen = 0;
+                handleMouseEvent();
+                if (!mouse_seen) { typing_mode = 0; continue; }
+                continue;
+            }
+            handleTyping(c);
+            continue;
+        }
 
-        // Ctrl+S to save (IXON is disabled, so it reaches us)
-        if (c == 19) { saveFile(); continue; }
+        // Dispatch through command table first.
+        int cmd_handled = 0;
+        for (int i = 0; commands[i].key; i++) {
+            if (c == commands[i].key) {
+                commands[i].handler();
+                cmd_handled = 1;
+                break;
+            }
+        }
+        if (cmd_handled) continue;
+        if (quit) break;
 
         // ESC starts an SGR mouse report; anything else is a key press
         if (c == '\x1b') {
