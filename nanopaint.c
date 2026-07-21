@@ -57,6 +57,7 @@ static int brush_color = 7;           /* 0-9, 7 = white */
 /* ----------------------------------------------------------------- */
 
 static int is_drawing = 0;
+static int last_paint_x = -1, last_paint_y = -1;
 
 /* ----------------------------------------------------------------- */
 /*  Cell colours — parallel array, one byte per cell, 0-9             */
@@ -197,6 +198,22 @@ static void paint_cell(int x, int y) {
         int idx = y * canvas_cols + x;
         strcpy(canvas[idx], brush);
         cell_colors[idx] = brush_color;
+    }
+}
+
+// Bresenham's line algorithm — paint all cells between (x0,y0) and (x1,y1)
+static void paint_line(int x0, int y0, int x1, int y1) {
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = (dx > dy ? dx : -dy) / 2;
+    for (;;) {
+        paint_cell(x0, y0);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = err;
+        if (e2 > -dx) { err -= dy; x0 += sx; }
+        if (e2 <  dy) { err += dx; y0 += sy; }
     }
 }
 
@@ -435,9 +452,15 @@ static void handleMouseEvent(void) {
     // button 0 = press, 32 = drag, 35 = release with motion, 'm' = release
     if (button == 0) {
         is_drawing = 1;
+        last_paint_x = cx;
+        last_paint_y = cy;
         paint_cell(cx, cy);
     } else if (button == 32) {
-        if (is_drawing) paint_cell(cx, cy);
+        if (is_drawing && (cx != last_paint_x || cy != last_paint_y)) {
+            paint_line(last_paint_x, last_paint_y, cx, cy);
+            last_paint_x = cx;
+            last_paint_y = cy;
+        }
     } else if (button == 35) {
         is_drawing = 0;
     }
