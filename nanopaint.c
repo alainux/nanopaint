@@ -16,6 +16,47 @@
 #include <sys/ioctl.h>
 
 /* ----------------------------------------------------------------- */
+/*  Constants                                                         */
+/* ----------------------------------------------------------------- */
+
+#define CSI             "\x1b["          /* Control Sequence Introducer */
+#define ESC             "\x1b"           /* Escape character */
+
+/* Terminal mode strings (used with write()) */
+#define MODE_ALT_BUF    CSI "?1049h" CSI "?25l" CSI "?1003h" CSI "?1006h"
+#define MODE_NORMAL     CSI "?25h"   CSI "?1003l" CSI "?1006l" CSI "?1049l"
+#define CLR_SCREEN      CSI "2J"
+#define HOME_CURSOR     CSI "H"
+
+/* printf()-style format strings */
+#define FMT_CURSOR_ROW  CSI "%d;1H"      /* move to start of row N */
+#define FMT_CURSOR_POS  CSI "%d;%dH"     /* move to (row, col) */
+#define FMT_SET_COLOR   CSI "%dm"        /* set foreground colour */
+#define RESET_COLOR     CSI "39m"        /* reset foreground colour */
+#define REV_ON          CSI "7m"         /* reverse video on */
+#define REV_OFF         CSI "27m"        /* reverse video off */
+#define CLR_EOL         CSI "K"          /* clear to end of line */
+
+/* Key / control codes */
+#define KEY_ESC         27
+#define KEY_BACKSPACE   127
+#define KEY_CTRL_C      3
+#define KEY_CTRL_S      19
+#define KEY_CTRL_T      20
+#define KEY_CTRL_Y      25
+#define KEY_CTRL_Z      26
+
+/* Canvas cell — each cell holds a UTF-8 character (up to 4 bytes + NUL) */
+#define CELL_SIZE       5
+
+/* Default colour index used for blank cells and the initial brush */
+#define DEFAULT_COLOR   7
+
+/* Printable ASCII range (space through tilde) */
+#define ASCII_MIN       32
+#define ASCII_MAX       126
+
+/* ----------------------------------------------------------------- */
 /*  Terminal state                                                   */
 /* ----------------------------------------------------------------- */
 
@@ -29,13 +70,13 @@ static volatile sig_atomic_t quit;     /* exit flag for signal handler */
 static const char *filepath = NULL;
 
 /* ----------------------------------------------------------------- */
-/*  Canvas — a 2D grid of characters (cell = char[5])                 */
+/*  Canvas — a 2D grid of characters (cell = char[CELL_SIZE])        */
 /* ----------------------------------------------------------------- */
 /*  Each cell holds a single character, up to 4 bytes (UTF-8) plus   */
 /*  a null terminator. This means emojis are supported.               */
 /* ----------------------------------------------------------------- */
 
-static char (*canvas)[5] = NULL;       /* the cell grid */
+static char (*canvas)[CELL_SIZE] = NULL; /* the cell grid */
 static int canvas_rows = 0;            /* number of rows in canvas */
 static int canvas_cols = 0;            /* number of columns in canvas */
 
@@ -49,8 +90,8 @@ static int mx = -1, my = -1;          /* 1-based, -1 = hasn't moved yet */
 /*  Brush — the character and colour painted on click-drag            */
 /* ----------------------------------------------------------------- */
 
-static char brush[5] = "#";
-static int brush_color = 7;           /* 0-9, 7 = white */
+static char brush[CELL_SIZE] = "#";
+static int brush_color = DEFAULT_COLOR; /* 0-9, DEFAULT_COLOR = white */
 
 /* ----------------------------------------------------------------- */
 /*  Drawing state                                                     */
@@ -72,7 +113,7 @@ static int mouse_seen = 0;               /* set by handleMouseEvent on valid par
 
 struct TypingEntry {
     int x, y;
-    char old_char[5];
+    char old_char[CELL_SIZE];
     unsigned char old_color;
     int is_newline;
 };
@@ -126,16 +167,16 @@ static struct CanvasState *save_state(void) {
     int n = canvas_rows * canvas_cols;
     s->rows = canvas_rows;
     s->cols = canvas_cols;
-    s->canvas = malloc(n * 5);
+    s->canvas = malloc(n * CELL_SIZE);
     s->colors = malloc(n);
-    if (s->canvas) memcpy(s->canvas, canvas, n * 5);
+    if (s->canvas) memcpy(s->canvas, canvas, n * CELL_SIZE);
     if (s->colors) memcpy(s->colors, cell_colors, n);
     return s;
 }
 
 static void restore_state(struct CanvasState *s) {
     int n = canvas_rows * canvas_cols;
-    memcpy(canvas, s->canvas, n * 5);
+    memcpy(canvas, s->canvas, n * CELL_SIZE);
     memcpy(cell_colors, s->colors, n);
 }
 
@@ -218,6 +259,14 @@ static const char *utf8_next(const char *s) {
     return s + utf8_len((unsigned char)*s);
 }
 
+// Validate that N continuation bytes are legal UTF-8 tail bytes (each
+// must match the pattern 10xxxxxx).
+static int valid_utf8_tail(const unsigned char *tail, int n) {
+    for (int i = 0; i < n; i++)
+        if ((tail[i] & 0xC0) != 0x80) return 0;
+    return 1;
+}
+
 /* ----------------------------------------------------------------- */
 /*  Switch terminal to raw mode                                       */
 /* ----------------------------------------------------------------- */
@@ -239,12 +288,7 @@ static void enableRawMode(void) {
 /* ----------------------------------------------------------------- */
 
 static void disableRawMode(void) {
-    // Escape codes:
-    // ESC[?25h      make cursor visible
-    // ESC[?1003l    disables any-event mouse tracking
-    // ESC[?1006l    disables SGR mouse encoding
-    // ESC[?1049l    disables the alternative buffer
-    write(STDOUT_FILENO, "\x1b[?25h\x1b[?1003l\x1b[?1006l\x1b[?1049l", 34);
+    write(STDOUT_FILENO, MODE_NORMAL, sizeof(MODE_NORMAL) - 1);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_tios);
 }
 
@@ -266,14 +310,10 @@ static void handler(int sig) {
 /* ----------------------------------------------------------------- */
 
 static void initTerminal(void) {
-    // ESC[?1049h   enables the alternative buffer
-    // ESC[?25l     make cursor invisible
-    // ESC[?1003h   enable any-event mouse tracking (motion without a button)
-    // ESC[?1006h   enable SGR-encoded mouse reports (unlimited coords)
-    // ESC[2J       erase entire screen
-    // ESC[H        moves cursor to home position (0, 0)
-    write(STDOUT_FILENO,
-        "\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[2J\x1b[H", 33);
+    // Enter alternate buffer, hide cursor, enable mouse tracking & SGR
+    // mode, then clear the screen and home the cursor.
+    write(STDOUT_FILENO, MODE_ALT_BUF CLR_SCREEN HOME_CURSOR,
+          sizeof(MODE_ALT_BUF CLR_SCREEN HOME_CURSOR) - 1);
 }
 
 /* ----------------------------------------------------------------- */
@@ -317,12 +357,12 @@ static void initBlankCanvas(void) {
     ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
     canvas_rows = ws.ws_row;
     canvas_cols = ws.ws_col;
-    canvas = malloc(canvas_rows * canvas_cols * 5);
+    canvas = malloc(canvas_rows * canvas_cols * CELL_SIZE);
     cell_colors = malloc(canvas_rows * canvas_cols);
     for (int i = 0; i < canvas_rows * canvas_cols; i++) {
         canvas[i][0] = ' ';
         canvas[i][1] = '\0';
-        cell_colors[i] = 7;
+        cell_colors[i] = DEFAULT_COLOR;
     }
 }
 
@@ -336,7 +376,7 @@ static void initBlankCanvas(void) {
 static int count_visible_chars(const char *s) {
     int n = 0;
     while (*s) {
-        if ((unsigned char)*s == '\x1b' && *(s + 1) == '[') {
+        if ((unsigned char)*s == KEY_ESC && *(s + 1) == '[') {
             s += 2;
             while (*s && *s != 'm') s++;
             if (*s == 'm') s++;
@@ -353,9 +393,9 @@ static int count_visible_chars(const char *s) {
 // following characters until the next code (or end of line).  Plain
 // text with no ANSI codes gets colour 7 (white).
 static void fill_row(const char *line, int row) {
-    int c = 0, color = 7;
+    int c = 0, color = DEFAULT_COLOR;
     while (*line && c < canvas_cols) {
-        if ((unsigned char)*line == '\x1b' && *(line + 1) == '[') {
+        if ((unsigned char)*line == KEY_ESC && *(line + 1) == '[') {
             line += 2;
             int val = 0;
             while (*line && *line != 'm') {
@@ -363,7 +403,7 @@ static void fill_row(const char *line, int row) {
                 line++;
             }
             if (*line == 'm') line++;
-            if (val == 0 || val == 39) { color = 7; }
+            if (val == 0 || val == 39) { color = DEFAULT_COLOR; }
             else {
                 for (int i = 0; i < 10; i++) {
                     if (ansi_colors[i] == val) { color = i; break; }
@@ -421,13 +461,13 @@ static void loadFile(const char *path) {
     // ---- Now we know the canvas dimensions. Allocate it. -------------
     canvas_rows = tmpnum;
     canvas_cols = max_line_chars;
-    canvas = malloc(canvas_rows * canvas_cols * 5);
+    canvas = malloc(canvas_rows * canvas_cols * CELL_SIZE);
     cell_colors = malloc(canvas_rows * canvas_cols);
     // Initialise every cell to a space character
     for (int i = 0; i < canvas_rows * canvas_cols; i++) {
         canvas[i][0] = ' ';
         canvas[i][1] = '\0';
-        cell_colors[i] = 7;
+        cell_colors[i] = DEFAULT_COLOR;
     }
 
     // ---- Fill the canvas from the temporary lines. ------------------
@@ -457,17 +497,11 @@ static void render(void) {
     int draw_rows = (canvas_rows < avail_rows) ? canvas_rows : avail_rows;
 
     for (int r = 0; r < draw_rows; r++) {
-        // Move cursor to start of row (1-based), clear to end of line,
-        // then draw the row content. This row-by-row clear+draw avoids
-        // the flicker of clearing the entire screen first.
-        // ESC[<row>;1H  = position cursor at row, column 1 (1-based)
-        // ESC[K         = clear from cursor to end of line
-        printf("\x1b[%d;1H\x1b[K", r + 1);
+        // Move to start of row, clear it, then build & print the line.
+        printf(FMT_CURSOR_ROW CLR_EOL, r + 1);
 
-        // Build a line from the cells of this row; stop at screen_cols.
-        // Each cell is a NUL-terminated UTF-8 string, so we just
-        // concatenate them. Emit ANSI colour codes when the colour
-        // changes between cells.
+        // Build a line string from the cells of this row.
+        // Emit ANSI colour codes whenever the colour changes.
         char linebuf[8192];
         int pos = 0;
         int last_color = -1;
@@ -475,10 +509,10 @@ static void render(void) {
 
         for (int c = 0; c < max_cells; c++) {
             int idx = r * canvas_cols + c;
-            int color = cell_colors ? cell_colors[idx] : 7;
+            int color = cell_colors ? cell_colors[idx] : DEFAULT_COLOR;
             if (color != last_color) {
                 pos += snprintf(linebuf + pos, sizeof(linebuf) - pos,
-                                "\x1b[%dm", ansi_colors[color]);
+                                FMT_SET_COLOR, ansi_colors[color]);
                 last_color = color;
             }
             char *cell = canvas[idx];
@@ -488,40 +522,36 @@ static void render(void) {
         }
         linebuf[pos] = '\0';
 
-        // Print the built line, then reset colour.
-        printf("%s\x1b[39m", linebuf);
+        printf("%s" RESET_COLOR, linebuf);
     }
 
     // Clear any remaining rows below the canvas (including toolbar row).
     for (int r = draw_rows; r <= screen_rows; r++) {
-        printf("\x1b[%d;1H\x1b[K", r + 1);
+        printf(FMT_CURSOR_ROW CLR_EOL, r + 1);
     }
 
-    // Draw the toolbar at the bottom of the terminal.
-    // ESC[7m/27m = reverse video on/off for a "status bar" look.
-    // ESC[<N>m / 39m = set / reset foreground colour.
-    int tool_row = screen_rows;
-    printf("\x1b[%d;1H\x1b[7m", tool_row);
+    // Draw the toolbar at the bottom of the terminal (reverse video).
+    printf(FMT_CURSOR_ROW REV_ON, screen_rows);
     if (typing_mode && typing_x >= 0) {
-        printf(" Type @ %d,%d \x1b[27m\x1b[39m  |  ^C:quit", typing_x, typing_y);
+        printf(" Type @ %d,%d " REV_OFF RESET_COLOR "  |  ^C:quit",
+               typing_x, typing_y);
     } else if (typing_mode) {
-        printf(" Type: click canvas \x1b[27m\x1b[39m  |  ^C:quit");
+        printf(" Type: click canvas " REV_OFF RESET_COLOR "  |  ^C:quit");
     } else {
-        printf(" Brush: \x1b[%dm %s \x1b[27m\x1b[39m"
+        printf(" Brush: " FMT_SET_COLOR " %s " REV_OFF RESET_COLOR
                "  %s  |  0-9:color  ^S:save  ^Z:undo  ^Y:redo  ^T:type  ^C:quit",
                ansi_colors[brush_color], brush, color_names[brush_color]);
     }
 
-    // Draw the solid cursor square on top, in the current brush colour.
-    // Only show in the canvas area (not in the toolbar row).
+    // Draw a solid cursor square on the canvas (reverse video block).
     if (typing_mode && typing_x >= 0 && typing_y >= 0) {
         int tx = typing_x + 1, ty = typing_y + 1;
         if (tx <= screen_cols && ty < screen_rows) {
-            printf("\x1b[%d;%dH\x1b[%dm\x1b[7m \x1b[27m\x1b[39m",
+            printf(FMT_CURSOR_POS FMT_SET_COLOR REV_ON " " REV_OFF RESET_COLOR,
                    ty, tx, ansi_colors[brush_color]);
         }
     } else if (mx >= 1 && my >= 1 && mx <= screen_cols && my < screen_rows) {
-        printf("\x1b[%d;%dH\x1b[%dm\x1b[7m \x1b[27m\x1b[39m",
+        printf(FMT_CURSOR_POS FMT_SET_COLOR REV_ON " " REV_OFF RESET_COLOR,
                my, mx, ansi_colors[brush_color]);
     }
 
@@ -566,10 +596,10 @@ static void handleMouseEvent(void) {
     mouse_seen = 1;
     mx = x; my = y;
     int cx = x - 1, cy = y - 1;
+    int in_bounds = cx >= 0 && cx < canvas_cols && cy >= 0 && cy < canvas_rows;
 
     // In typing mode, a click positions the cursor instead of painting.
-    if (typing_mode && button == 0
-        && cx >= 0 && cx < canvas_cols && cy >= 0 && cy < canvas_rows) {
+    if (typing_mode && button == 0 && in_bounds) {
         typing_x = typing_anchor_x = cx;
         typing_y = typing_anchor_y = cy;
         return;
@@ -577,13 +607,12 @@ static void handleMouseEvent(void) {
 
     // button 0 = press, 32 = drag, 35 = release with motion
     if (button == 0) {
-        if (cx >= 0 && cx < canvas_cols && cy >= 0 && cy < canvas_rows) {
-            push_undo();
-            is_drawing = 1;
-            last_paint_x = cx;
-            last_paint_y = cy;
-            paint_cell(cx, cy);
-        }
+        if (!in_bounds) return;
+        push_undo();
+        is_drawing = 1;
+        last_paint_x = cx;
+        last_paint_y = cy;
+        paint_cell(cx, cy);
     } else if (button == 32) {
         if (is_drawing && (cx != last_paint_x || cy != last_paint_y)) {
             paint_line(last_paint_x, last_paint_y, cx, cy);
@@ -631,24 +660,18 @@ static void handleKey(unsigned char c) {
     // by reading continuation bytes.
     unsigned char uc = c;
     int len = utf8_len(uc);
-    if (len == 1 && uc >= 32 && uc <= 126) {
+    if (len == 1 && uc >= ASCII_MIN && uc <= ASCII_MAX) {
         brush[0] = c;
         brush[1] = '\0';
     } else if (len > 1) {
         unsigned char tail[4];
         int got = readn(tail, len - 1);
-        if (got == len - 1) {
-            int ok = 1;
-            for (int i = 0; i < len - 1; i++) {
-                if ((tail[i] & 0xC0) != 0x80) { ok = 0; break; }
-            }
-            if (ok) {
-                char tmp[5];
-                tmp[0] = c;
-                for (int i = 0; i < len - 1; i++) tmp[i + 1] = tail[i];
-                tmp[len] = '\0';
-                strcpy(brush, tmp);
-            }
+        if (got == len - 1 && valid_utf8_tail(tail, len - 1)) {
+            char tmp[CELL_SIZE];
+            tmp[0] = c;
+            for (int i = 0; i < len - 1; i++) tmp[i + 1] = tail[i];
+            tmp[len] = '\0';
+            strcpy(brush, tmp);
         }
     }
 }
@@ -670,9 +693,9 @@ static void saveFile(void) {
         int last_color = -1;
         for (int c = 0; c < canvas_cols; c++) {
             int idx = r * canvas_cols + c;
-            int color = cell_colors ? cell_colors[idx] : 7;
+            int color = cell_colors ? cell_colors[idx] : DEFAULT_COLOR;
             if (color != last_color) {
-                fprintf(fp, "\x1b[%dm", ansi_colors[color]);
+                fprintf(fp, FMT_SET_COLOR, ansi_colors[color]);
                 last_color = color;
             }
             char *cell = canvas[idx];
@@ -692,6 +715,7 @@ static void saveFile(void) {
 static void cmd_quit(void) { quit = 1; }
 static void cmd_save(void) { saveFile(); }
 static void cmd_type(void) {
+    push_undo();
     typing_mode = 1;
     typing_x = typing_y = -1;
     typing_history_count = 0;
@@ -700,17 +724,40 @@ static void cmd_type(void) {
 // The command table: each entry maps a key byte to a named action.
 // To add a new command, add an entry here and define the handler above.
 static const struct Command commands[] = {
-    { 3,  "C",   "Quit",  cmd_quit },
-    { 19, "S",   "Save",  cmd_save },
-    { 26, "Z",   "Undo",  undo     },
-    { 25, "Y",   "Redo",  redo     },
-    { 20, "T",   "Type",  cmd_type },
-    { 0,  NULL,  NULL,  NULL       }
+    { KEY_CTRL_C, "C", "Quit",  cmd_quit },
+    { KEY_CTRL_S, "S", "Save",  cmd_save },
+    { KEY_CTRL_Z, "Z", "Undo",  undo     },
+    { KEY_CTRL_Y, "Y", "Redo",  redo     },
+    { KEY_CTRL_T, "T", "Type",  cmd_type },
+    { 0,          NULL, NULL,   NULL      }
 };
 
 /* ----------------------------------------------------------------- */
 /*  Typing-mode key handler                                           */
 /* ----------------------------------------------------------------- */
+
+// Save the current cell's contents into the typing history so that a
+// subsequent backspace can restore it.
+static void save_typing_cell(void) {
+    if (typing_history_count >= MAX_TYPING_HISTORY) return;
+    struct TypingEntry *e = &typing_history[typing_history_count];
+    e->x = typing_x;
+    e->y = typing_y;
+    memcpy(e->old_char, &canvas[typing_y * canvas_cols + typing_x], CELL_SIZE);
+    e->old_color = cell_colors[typing_y * canvas_cols + typing_x];
+    e->is_newline = 0;
+    typing_history_count++;
+}
+
+// Write a character (a NUL-terminated UTF-8 string in *s*, at most
+// CELL_SIZE-1 displayable bytes) into the current typing cell and advance
+// the cursor.
+static void write_typing_cell(const char *s) {
+    int idx = typing_y * canvas_cols + typing_x;
+    strcpy(canvas[idx], s);
+    cell_colors[idx] = brush_color;
+    typing_x++;
+}
 
 static void handleTyping(unsigned char c) {
     if (typing_x < 0 || typing_y < 0) return;
@@ -726,63 +773,34 @@ static void handleTyping(unsigned char c) {
         typing_y++;
         if (typing_y >= canvas_rows) typing_y = canvas_rows - 1;
         typing_x = typing_anchor_x;
-    } else if (c == 127) {
+    } else if (c == KEY_BACKSPACE) {
         if (typing_history_count > 0) {
             typing_history_count--;
             struct TypingEntry *e = &typing_history[typing_history_count];
             if (!e->is_newline) {
-                memcpy(&canvas[e->y * canvas_cols + e->x], e->old_char, 5);
+                memcpy(&canvas[e->y * canvas_cols + e->x], e->old_char, CELL_SIZE);
                 cell_colors[e->y * canvas_cols + e->x] = e->old_color;
             }
             typing_x = e->x;
             typing_y = e->y;
         }
-    } else if (c >= 32 && c <= 126) {
-        if (typing_x < canvas_cols) {
-            if (typing_history_count < MAX_TYPING_HISTORY) {
-                struct TypingEntry *e = &typing_history[typing_history_count];
-                e->x = typing_x;
-                e->y = typing_y;
-                memcpy(e->old_char, &canvas[typing_y * canvas_cols + typing_x], 5);
-                e->old_color = cell_colors[typing_y * canvas_cols + typing_x];
-                e->is_newline = 0;
-                typing_history_count++;
-            }
-            int idx = typing_y * canvas_cols + typing_x;
-            canvas[idx][0] = c;
-            canvas[idx][1] = '\0';
-            cell_colors[idx] = brush_color;
-            typing_x++;
-        }
+    } else if (c >= ASCII_MIN && c <= ASCII_MAX) {
+        if (typing_x >= canvas_cols) return;
+        char buf[CELL_SIZE] = { c, '\0' };
+        save_typing_cell();
+        write_typing_cell(buf);
     } else {
         unsigned char uc = c;
         int len = utf8_len(uc);
-        if (len > 1 && typing_x < canvas_cols) {
-            unsigned char tail[4];
-            int got = readn(tail, len - 1);
-            if (got == len - 1) {
-                int ok = 1;
-                for (int i = 0; i < len - 1; i++)
-                    if ((tail[i] & 0xC0) != 0x80) { ok = 0; break; }
-                if (ok) {
-                    if (typing_history_count < MAX_TYPING_HISTORY) {
-                        struct TypingEntry *e = &typing_history[typing_history_count];
-                        e->x = typing_x;
-                        e->y = typing_y;
-                        memcpy(e->old_char, &canvas[typing_y * canvas_cols + typing_x], 5);
-                        e->old_color = cell_colors[typing_y * canvas_cols + typing_x];
-                        e->is_newline = 0;
-                        typing_history_count++;
-                    }
-                    int idx = typing_y * canvas_cols + typing_x;
-                    canvas[idx][0] = c;
-                    for (int i = 0; i < len - 1; i++) canvas[idx][i + 1] = tail[i];
-                    canvas[idx][len] = '\0';
-                    cell_colors[idx] = brush_color;
-                    typing_x++;
-                }
-            }
-        }
+        if (len <= 1 || typing_x >= canvas_cols) return;
+        unsigned char tail[4];
+        if (readn(tail, len - 1) != len - 1) return;
+        if (!valid_utf8_tail(tail, len - 1)) return;
+        char buf[CELL_SIZE] = { '\0' };
+        buf[0] = c;
+        for (int i = 0; i < len - 1; i++) buf[i + 1] = tail[i];
+        save_typing_cell();
+        write_typing_cell(buf);
     }
 }
 
@@ -801,11 +819,10 @@ static void mainLoop(void) {
         // ESC exits typing mode; a standalone ESC is detected when
         // handleMouseEvent returns without seeing a valid SGR report.
         if (typing_mode) {
-            if (c == '\x1b') {
+            if (c == KEY_ESC) {
                 mouse_seen = 0;
                 handleMouseEvent();
                 if (!mouse_seen) {
-                    if (typing_history_count > 0) push_undo();
                     typing_history_count = 0;
                     typing_mode = 0;
                     continue;
@@ -829,7 +846,7 @@ static void mainLoop(void) {
         if (quit) break;
 
         // ESC starts an SGR mouse report; anything else is a key press
-        if (c == '\x1b') {
+        if (c == KEY_ESC) {
             handleMouseEvent();
         } else {
             handleKey(c);
