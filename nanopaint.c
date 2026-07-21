@@ -68,6 +68,18 @@ static int typing_x = -1, typing_y = -1; /* cursor position, -1 = unset */
 static int typing_anchor_x = -1, typing_anchor_y = -1; /* where click landed */
 static int mouse_seen = 0;               /* set by handleMouseEvent on valid parse */
 
+#define MAX_TYPING_HISTORY 4096
+
+struct TypingEntry {
+    int x, y;
+    char old_char[5];
+    unsigned char old_color;
+    int is_newline;
+};
+
+static struct TypingEntry typing_history[MAX_TYPING_HISTORY];
+static int typing_history_count = 0;
+
 /* ----------------------------------------------------------------- */
 /*  Cell colours — parallel array, one byte per cell, 0-9             */
 /* ----------------------------------------------------------------- */
@@ -558,7 +570,6 @@ static void handleMouseEvent(void) {
     // In typing mode, a click positions the cursor instead of painting.
     if (typing_mode && button == 0
         && cx >= 0 && cx < canvas_cols && cy >= 0 && cy < canvas_rows) {
-        push_undo();
         typing_x = typing_anchor_x = cx;
         typing_y = typing_anchor_y = cy;
         return;
@@ -680,7 +691,11 @@ static void saveFile(void) {
 
 static void cmd_quit(void) { quit = 1; }
 static void cmd_save(void) { saveFile(); }
-static void cmd_type(void) { typing_mode = 1; typing_x = typing_y = -1; }
+static void cmd_type(void) {
+    typing_mode = 1;
+    typing_x = typing_y = -1;
+    typing_history_count = 0;
+}
 
 // The command table: each entry maps a key byte to a named action.
 // To add a new command, add an entry here and define the handler above.
@@ -697,34 +712,42 @@ static const struct Command commands[] = {
 /*  Typing-mode key handler                                           */
 /* ----------------------------------------------------------------- */
 
-// Find the last non-space column on a given row (-1 if the row is blank).
-static int last_content_col(int row) {
-    for (int c = canvas_cols - 1; c >= 0; c--)
-        if (canvas[row * canvas_cols + c][0] != ' ') return c;
-    return -1;
-}
-
 static void handleTyping(unsigned char c) {
     if (typing_x < 0 || typing_y < 0) return;
 
     if (c == '\r' || c == '\n') {
-        typing_y++;
-        typing_x = typing_anchor_x;
-        if (typing_y >= canvas_rows) typing_y = canvas_rows - 1;
-    } else if (c == 127) {
-        if (typing_x > 0) {
-            typing_x--;
-        } else if (typing_y > 0) {
-            typing_y--;
-            int last = last_content_col(typing_y);
-            typing_x = (last >= 0) ? last : 0;
+        if (typing_history_count < MAX_TYPING_HISTORY) {
+            struct TypingEntry *e = &typing_history[typing_history_count];
+            e->x = typing_x;
+            e->y = typing_y;
+            e->is_newline = 1;
+            typing_history_count++;
         }
-        int idx = typing_y * canvas_cols + typing_x;
-        canvas[idx][0] = ' ';
-        canvas[idx][1] = '\0';
-        cell_colors[idx] = brush_color;
+        typing_y++;
+        if (typing_y >= canvas_rows) typing_y = canvas_rows - 1;
+        typing_x = typing_anchor_x;
+    } else if (c == 127) {
+        if (typing_history_count > 0) {
+            typing_history_count--;
+            struct TypingEntry *e = &typing_history[typing_history_count];
+            if (!e->is_newline) {
+                memcpy(&canvas[e->y * canvas_cols + e->x], e->old_char, 5);
+                cell_colors[e->y * canvas_cols + e->x] = e->old_color;
+            }
+            typing_x = e->x;
+            typing_y = e->y;
+        }
     } else if (c >= 32 && c <= 126) {
         if (typing_x < canvas_cols) {
+            if (typing_history_count < MAX_TYPING_HISTORY) {
+                struct TypingEntry *e = &typing_history[typing_history_count];
+                e->x = typing_x;
+                e->y = typing_y;
+                memcpy(e->old_char, &canvas[typing_y * canvas_cols + typing_x], 5);
+                e->old_color = cell_colors[typing_y * canvas_cols + typing_x];
+                e->is_newline = 0;
+                typing_history_count++;
+            }
             int idx = typing_y * canvas_cols + typing_x;
             canvas[idx][0] = c;
             canvas[idx][1] = '\0';
@@ -742,6 +765,15 @@ static void handleTyping(unsigned char c) {
                 for (int i = 0; i < len - 1; i++)
                     if ((tail[i] & 0xC0) != 0x80) { ok = 0; break; }
                 if (ok) {
+                    if (typing_history_count < MAX_TYPING_HISTORY) {
+                        struct TypingEntry *e = &typing_history[typing_history_count];
+                        e->x = typing_x;
+                        e->y = typing_y;
+                        memcpy(e->old_char, &canvas[typing_y * canvas_cols + typing_x], 5);
+                        e->old_color = cell_colors[typing_y * canvas_cols + typing_x];
+                        e->is_newline = 0;
+                        typing_history_count++;
+                    }
                     int idx = typing_y * canvas_cols + typing_x;
                     canvas[idx][0] = c;
                     for (int i = 0; i < len - 1; i++) canvas[idx][i + 1] = tail[i];
@@ -772,7 +804,12 @@ static void mainLoop(void) {
             if (c == '\x1b') {
                 mouse_seen = 0;
                 handleMouseEvent();
-                if (!mouse_seen) { typing_mode = 0; continue; }
+                if (!mouse_seen) {
+                    if (typing_history_count > 0) push_undo();
+                    typing_history_count = 0;
+                    typing_mode = 0;
+                    continue;
+                }
                 continue;
             }
             handleTyping(c);
